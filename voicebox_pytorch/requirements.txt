@@ -1,0 +1,10 @@
+accelerate,
+audiolm-pytorch>=1.2.28,
+naturalspeech2-pytorch>=0.1.8,
+beartype,
+einops>=0.6.1,
+gateloop-transformer>=0.2.4,
+torch>=2.0,
+torchdiffeq,
+torchode,
+vocos

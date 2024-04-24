@@ -11,38 +11,45 @@ from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, random_split
 
-from voicebox_pytorch.voicebox_pytorch import ConditionalFlowMatcherWrapper
-from voicebox_pytorch.data import get_dataloader
-from voicebox_pytorch.optimizer import get_optimizer
+from voicebox_pytorch import ConditionalFlowMatcherWrapper
+from data import get_dataloader
+from optimizer import get_optimizer
 
 from accelerate import Accelerator, DistributedType
 from accelerate.utils import DistributedDataParallelKwargs
 
 # helpers
 
+
 def exists(val):
     return val is not None
 
+
 def noop(*args, **kwargs):
     pass
+
 
 def cycle(dl):
     while True:
         for data in dl:
             yield data
 
+
 def cast_tuple(t):
     return t if isinstance(t, (tuple, list)) else (t,)
 
+
 def yes_or_no(question):
-    answer = input(f'{question} (y/n) ')
-    return answer.lower() in ('yes', 'y')
+    answer = input(f"{question} (y/n) ")
+    return answer.lower() in ("yes", "y")
+
 
 def accum_log(log, new_logs):
     for key, new_value in new_logs.items():
-        old_value = log.get(key, 0.)
+        old_value = log.get(key, 0.0)
         log[key] = old_value + new_value
     return log
+
 
 def checkpoint_num_steps(checkpoint_path):
     """Returns the number of steps trained from a checkpoint based on the filename.
@@ -50,12 +57,13 @@ def checkpoint_num_steps(checkpoint_path):
     Filename format assumed to be something like "/path/to/voicebox.20000.pt" which is
     for 20k train steps. Returns 20000 in that case.
     """
-    results = re.findall(r'\d+', str(checkpoint_path))
+    results = re.findall(r"\d+", str(checkpoint_path))
 
     if len(results) == 0:
         return 0
 
     return int(results[-1])
+
 
 class VoiceBoxTrainer(nn.Module):
     @beartype
@@ -65,53 +73,44 @@ class VoiceBoxTrainer(nn.Module):
         *,
         batch_size,
         dataset: Dataset,
-        num_train_steps = None,
-        num_warmup_steps = None,
-        num_epochs = None,
-        lr = 3e-4,
-        initial_lr = 1e-5,
-        grad_accum_every = 1,
-        wd = 0.,
-        max_grad_norm = 0.5,
-        valid_frac = 0.05,
-        random_split_seed = 42,
-        log_every = 10,
-        save_results_every = 100,
-        save_model_every = 1000,
-        results_folder = './results',
-        force_clear_prev_results = None,
-        split_batches = False,
-        drop_last = False,
+        num_train_steps=None,
+        num_warmup_steps=None,
+        num_epochs=None,
+        lr=3e-4,
+        initial_lr=1e-5,
+        grad_accum_every=1,
+        wd=0.0,
+        max_grad_norm=0.5,
+        valid_frac=0.05,
+        random_split_seed=42,
+        log_every=10,
+        save_results_every=1000,
+        save_model_every=2000,
+        results_folder="./results",
+        force_clear_prev_results=None,
+        split_batches=False,
+        drop_last=False,
         accelerate_kwargs: dict = dict(),
     ):
         super().__init__()
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
-        self.accelerator = Accelerator(
-            kwargs_handlers = [ddp_kwargs],
-            split_batches = split_batches,
-            **accelerate_kwargs
-        )
+        self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], split_batches=split_batches, **accelerate_kwargs)
 
         self.cfm_wrapper = cfm_wrapper
 
-        self.register_buffer('steps', torch.Tensor([0]))
+        self.register_buffer("steps", torch.Tensor([0]))
 
         self.batch_size = batch_size
         self.grad_accum_every = grad_accum_every
 
         # optimizer
 
-        self.optim = get_optimizer(
-            cfm_wrapper.parameters(),
-            lr = lr,
-            wd = wd
-        )
+        self.optim = get_optimizer(cfm_wrapper.parameters(), lr=lr, wd=wd)
 
         self.lr = lr
         self.initial_lr = initial_lr
-
 
         # max grad norm
 
@@ -126,16 +125,22 @@ class VoiceBoxTrainer(nn.Module):
         if valid_frac > 0:
             train_size = int((1 - valid_frac) * len(self.ds))
             valid_size = len(self.ds) - train_size
-            self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
-            self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
+            self.ds, self.valid_ds = random_split(
+                self.ds, [train_size, valid_size], generator=torch.Generator().manual_seed(random_split_seed)
+            )
+            self.print(
+                f"training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples"
+            )
         else:
             self.valid_ds = self.ds
-            self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
+            self.print(f"training with shared training and valid dataset of {len(self.ds)} samples")
 
-        assert len(self.ds) >= batch_size, 'dataset must have sufficient samples for training'
-        assert len(self.valid_ds) >= batch_size, f'validation dataset must have sufficient number of samples (currently {len(self.valid_ds)}) for training'
+        assert len(self.ds) >= batch_size, "dataset must have sufficient samples for training"
+        assert (
+            len(self.valid_ds) >= batch_size
+        ), f"validation dataset must have sufficient number of samples (currently {len(self.valid_ds)}) for training"
 
-        assert exists(num_train_steps) or exists(num_epochs), 'either num_train_steps or num_epochs must be specified'
+        assert exists(num_train_steps) or exists(num_epochs), "either num_train_steps or num_epochs must be specified"
 
         if exists(num_epochs):
             self.num_train_steps = len(dataset) // batch_size * num_epochs
@@ -143,24 +148,16 @@ class VoiceBoxTrainer(nn.Module):
             self.num_train_steps = num_train_steps
         self.scheduler = CosineAnnealingLR(self.optim, T_max=self.num_train_steps)
         self.num_warmup_steps = num_warmup_steps if exists(num_warmup_steps) else 0
-        
+
         # dataloader
 
-        self.dl = get_dataloader(self.ds, batch_size = batch_size, shuffle = True, drop_last = drop_last)
-        self.valid_dl = get_dataloader(self.valid_ds, batch_size = batch_size, shuffle = True, drop_last = drop_last)
+        self.dl = get_dataloader(self.ds, batch_size=batch_size, shuffle=True, drop_last=drop_last)
+        self.valid_dl = get_dataloader(self.valid_ds, batch_size=batch_size, shuffle=True, drop_last=drop_last)
 
         # prepare with accelerator
 
-        (
-            self.cfm_wrapper,
-            self.optim,
-            self.scheduler,
-            self.dl
-        ) = self.accelerator.prepare(
-            self.cfm_wrapper,
-            self.optim,
-            self.scheduler,
-            self.dl
+        (self.cfm_wrapper, self.optim, self.scheduler, self.dl) = self.accelerator.prepare(
+            self.cfm_wrapper, self.optim, self.scheduler, self.dl
         )
 
         # dataloader iterators
@@ -174,25 +171,33 @@ class VoiceBoxTrainer(nn.Module):
 
         self.results_folder = Path(results_folder)
 
-        if self.is_main and force_clear_prev_results is True or (not exists(force_clear_prev_results) and len([*self.results_folder.glob('**/*')]) > 0 and yes_or_no('do you want to clear previous experiment checkpoints and results?')):
+        if (
+            self.is_main
+            and force_clear_prev_results is True
+            or (
+                not exists(force_clear_prev_results)
+                and len([*self.results_folder.glob("**/*")]) > 0
+                and yes_or_no("do you want to clear previous experiment checkpoints and results?")
+            )
+        ):
             rmtree(str(self.results_folder))
 
-        self.results_folder.mkdir(parents = True, exist_ok = True)
-        
+        self.results_folder.mkdir(parents=True, exist_ok=True)
+
         hps = {
             "num_train_steps": self.num_train_steps,
             "num_warmup_steps": self.num_warmup_steps,
             "learning_rate": self.lr,
             "initial_learning_rate": self.initial_lr,
-            "wd": wd
+            "wd": wd,
         }
         self.accelerator.init_trackers("voicebox", config=hps)
 
     def save(self, path):
         pkg = dict(
-            model = self.accelerator.get_state_dict(self.cfm_wrapper),
-            optim = self.optim.state_dict(),
-            scheduler = self.scheduler.state_dict()
+            model=self.accelerator.get_state_dict(self.cfm_wrapper),
+            optim=self.optim.state_dict(),
+            scheduler=self.scheduler.state_dict(),
         )
         torch.save(pkg, path)
 
@@ -200,8 +205,8 @@ class VoiceBoxTrainer(nn.Module):
         cfm_wrapper = self.accelerator.unwrap_model(self.cfm_wrapper)
         pkg = cfm_wrapper.load(path)
 
-        self.optim.load_state_dict(pkg['optim'])
-        self.scheduler.load_state_dict(pkg['scheduler'])
+        self.optim.load_state_dict(pkg["optim"])
+        self.scheduler.load_state_dict(pkg["scheduler"])
 
         # + 1 to start from the next step and avoid overwriting the last checkpoint
         self.steps = torch.tensor([checkpoint_num_steps(path) + 1], device=self.device)
@@ -233,23 +238,23 @@ class VoiceBoxTrainer(nn.Module):
             return self.initial_lr + (self.lr - self.initial_lr) * step / self.num_warmup_steps
         else:
             return self.lr
-    
+
     def train_step(self):
         steps = int(self.steps.item())
 
         self.cfm_wrapper.train()
-        
+
         # adjust the lr according to the schedule
-        
+
         if steps < self.num_warmup_steps:
             # apply warmup
 
             lr = self.warmup(steps)
             for param_group in self.optim.param_groups:
-                param_group['lr'] = lr
+                param_group["lr"] = lr
         else:
             # after warmup period, start to apply lr annealing
-            
+
             self.scheduler.step()
 
         # logs
@@ -262,14 +267,15 @@ class VoiceBoxTrainer(nn.Module):
             is_last = grad_accum_step == (self.grad_accum_every - 1)
             context = partial(self.accelerator.no_sync, self.cfm_wrapper) if not is_last else nullcontext
 
-            wave, = next(self.dl_iter)
+            (batch,) = next(self.dl_iter)
 
             with self.accelerator.autocast(), context():
-                loss = self.cfm_wrapper(wave)
+                # what about the phonemes? already aligned? seems like it
+                loss = self.cfm_wrapper(batch["wave"], phoneme_ids=batch["phoneme_ids"], mask=batch["pad_mask"])
 
                 self.accelerator.backward(loss / self.grad_accum_every)
 
-            accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
+            accum_log(logs, {"loss": loss.item() / self.grad_accum_every})
 
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.cfm_wrapper.parameters(), self.max_grad_norm)
@@ -282,40 +288,42 @@ class VoiceBoxTrainer(nn.Module):
         if not steps % self.log_every:
             self.print(f"{steps}: loss: {logs['loss']:0.3f}")
 
-        self.accelerator.log({"train_loss": logs['loss']}, step=steps)
+        self.accelerator.log({"train_loss": logs["loss"]}, step=steps)
 
         # sample results every so often
 
         self.accelerator.wait_for_everyone()
 
-        if self.is_main and not (steps % self.save_results_every):
-            wave, = next(self.valid_dl_iter)
+        if self.is_main and not ((steps) % self.save_results_every):
+            (batch,) = next(self.valid_dl_iter)
             unwrapped_model = self.accelerator.unwrap_model(self.cfm_wrapper)
 
             with torch.inference_mode():
                 unwrapped_model.eval()
 
-                wave = wave.to(unwrapped_model.device)
-                valid_loss = unwrapped_model(wave)
+                wave = batch["wave"].to(unwrapped_model.device)
+                phoneme_ids = batch["phoneme_ids"].to(unwrapped_model.device)
+                mask = batch["pad_mask"].to(unwrapped_model.device)
+                valid_loss = unwrapped_model(wave, phoneme_ids=phoneme_ids, mask=mask)
 
-                self.print(f'{steps}: valid loss {valid_loss:0.3f}')
+                self.print(f"{steps}: valid loss {valid_loss:0.3f}")
                 self.accelerator.log({"valid_loss": valid_loss}, step=steps)
 
         # save model every so often
 
         if self.is_main and not (steps % self.save_model_every):
-            model_path = str(self.results_folder / f'voicebox.{steps}.pt')
+            model_path = str(self.results_folder / f"voicebox.{steps}.pt")
             self.save(model_path)
 
-            self.print(f'{steps}: saving model to {str(self.results_folder)}')
+            self.print(f"{steps}: saving model to {str(self.results_folder)}")
 
         self.steps += 1
         return logs
 
-    def train(self, log_fn = noop):
+    def train(self, log_fn=noop):
         while self.steps < self.num_train_steps:
             logs = self.train_step()
             log_fn(logs)
 
-        self.print('training complete')
+        self.print("training complete")
         self.accelerator.end_training()
