@@ -577,6 +577,7 @@ class EncodecVoco(AudioEncoderDecoder):
         encoded_audio, _, _ = self.encodec(audio, return_encoded=True)
         return encoded_audio
 
+    # --> LLM -> token_idx --> emb(128) --> VOCOS
     def decode_to_codes(self, latents):
         _, codes, _ = self.encodec.rq(latents)
         codes = rearrange(codes, "b n q -> b q n")
@@ -1072,6 +1073,7 @@ class VoiceBox(Module):
             cond_emb_length = cond_emb.shape[-2]
             # rearranging the cond_emb to match the seq_len, currently working also with phoneme_ids. Should this be changed in case of phoneme_ids?
             if cond_emb_length != seq_len:
+                print(f"Cond emb length: {cond_emb_length}, seq_len: {seq_len}")
                 cond_emb = rearrange(cond_emb, "b n d -> b d n")
                 cond_emb = interpolate_1d(cond_emb, seq_len)
                 cond_emb = rearrange(cond_emb, "b d n -> b n d")
@@ -1247,8 +1249,12 @@ class ConditionalFlowMatcherWrapper(Module):
                 )
                 cond_token_ids = aligned_phoneme_ids
             else:
-                assert exists(phoneme_ids), "phoneme ids must be passed in if not using duration predictor or text-to-semantic"
-                print("No duration predictor or text-to-semantic model found, but phoneme ids were passed in. The phonemes should be aligned with the audio.")
+                assert exists(
+                    phoneme_ids
+                ), "phoneme ids must be passed in if not using duration predictor or text-to-semantic"
+                print(
+                    "No duration predictor or text-to-semantic model found, but phoneme ids were passed in. The phonemes should be aligned with the audio."
+                )
                 cond_token_ids = phoneme_ids
 
             cond_tokens_seq_len = cond_token_ids.shape[-1]
@@ -1411,6 +1417,7 @@ class ConditionalFlowMatcherWrapper(Module):
             else:
                 assert exists(phoneme_ids)
                 cond_token_ids = phoneme_ids
+                x1 = curtail_or_pad(x1, cond_token_ids.shape[-1])
 
         # main conditional flow logic is below
 

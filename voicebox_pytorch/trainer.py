@@ -5,6 +5,8 @@ from functools import partial
 from contextlib import nullcontext
 
 from beartype import beartype
+from einops import rearrange
+import glob
 
 import torch
 from torch import nn
@@ -18,7 +20,10 @@ from optimizer import get_optimizer
 from accelerate import Accelerator, DistributedType
 from accelerate.utils import DistributedDataParallelKwargs
 
+from tensorboardX import SummaryWriter
+
 # helpers
+import gc
 
 
 def exists(val):
@@ -85,18 +90,16 @@ class VoiceBoxTrainer(nn.Module):
         random_split_seed=42,
         log_every=10,
         save_results_every=1000,
-        save_model_every=2000,
+        save_model_every=1000,
         results_folder="./results",
         force_clear_prev_results=None,
-        split_batches=False,
         drop_last=False,
-        accelerate_kwargs: dict = dict(),
+        accelerator=None,
     ):
         super().__init__()
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-
-        self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], split_batches=split_batches, **accelerate_kwargs)
+        # accelerator
+        self.accelerator = accelerator
 
         self.cfm_wrapper = cfm_wrapper
 
@@ -174,13 +177,11 @@ class VoiceBoxTrainer(nn.Module):
         if (
             self.is_main
             and force_clear_prev_results is True
-            or (
-                not exists(force_clear_prev_results)
-                and len([*self.results_folder.glob("**/*")]) > 0
-                and yes_or_no("do you want to clear previous experiment checkpoints and results?")
-            )
+            or (not exists(force_clear_prev_results) and len([*self.results_folder.glob("**/*")]) > 0)
         ):
-            rmtree(str(self.results_folder))
+            if self.is_main:
+                if yes_or_no("do you want to clear previous experiment checkpoints and results?"):
+                    rmtree(str(self.results_folder))
 
         self.results_folder.mkdir(parents=True, exist_ok=True)
 
@@ -192,6 +193,15 @@ class VoiceBoxTrainer(nn.Module):
             "wd": wd,
         }
         self.accelerator.init_trackers("voicebox", config=hps)
+
+        # log on tensorboard
+        if self.is_main:
+            log_dir = "./runs"
+            existing_runs = glob.glob(f"{log_dir}/*")
+            run_index = len(existing_runs) + 1
+            self.writer = SummaryWriter(log_dir=f"{log_dir}/{run_index}")
+
+        self.total_len = len(self.ds) // batch_size
 
     def save(self, path):
         pkg = dict(
@@ -270,8 +280,11 @@ class VoiceBoxTrainer(nn.Module):
             (batch,) = next(self.dl_iter)
 
             with self.accelerator.autocast(), context():
-                # what about the phonemes? already aligned? seems like it
-                loss = self.cfm_wrapper(batch["wave"], phoneme_ids=batch["phoneme_ids"], mask=batch["pad_mask"])
+                loss = self.cfm_wrapper(
+                    batch["wave"].half(),
+                    phoneme_ids=batch["phoneme_ids"],
+                    mask=batch["pad_mask"],
+                )
 
                 self.accelerator.backward(loss / self.grad_accum_every)
 
@@ -280,6 +293,10 @@ class VoiceBoxTrainer(nn.Module):
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.cfm_wrapper.parameters(), self.max_grad_norm)
 
+        del batch
+        gc.collect()
+        torch.cuda.empty_cache()
+
         self.optim.step()
         self.optim.zero_grad()
 
@@ -287,6 +304,10 @@ class VoiceBoxTrainer(nn.Module):
 
         if not steps % self.log_every:
             self.print(f"{steps}: loss: {logs['loss']:0.3f}")
+        if self.is_main:
+            self.writer.add_scalar("Train/train_loss", logs["loss"], steps)
+            percentage_processed = steps / self.total_len
+            self.writer.add_scalar("Train/Percentage_processed", percentage_processed, steps)
 
         self.accelerator.log({"train_loss": logs["loss"]}, step=steps)
 
@@ -306,8 +327,21 @@ class VoiceBoxTrainer(nn.Module):
                 mask = batch["pad_mask"].to(unwrapped_model.device)
                 valid_loss = unwrapped_model(wave, phoneme_ids=phoneme_ids, mask=mask)
 
+                # unconditional generation
+                output_wave = unwrapped_model.sample(phoneme_ids=phoneme_ids[0].unsqueeze(0), steps=32, cond_scale=1.0)
+                output_wave = rearrange(output_wave, "1 1 n -> 1 n")
+
+                # save audio
+                self.writer.add_audio(
+                    "Generated_sample", output_wave.detach().cpu().view(-1).unsqueeze(-1), steps, sample_rate=24_000
+                )
+
                 self.print(f"{steps}: valid loss {valid_loss:0.3f}")
                 self.accelerator.log({"valid_loss": valid_loss}, step=steps)
+
+                del batch
+                gc.collect()
+                torch.cuda.empty_cache()
 
         # save model every so often
 
