@@ -10,7 +10,7 @@ from einops import rearrange
 from beartype import beartype
 from beartype.door import is_bearable
 from beartype.typing import Optional, Tuple, Union
-
+import random
 import torch
 import torchaudio
 from torch.nn.utils.rnn import pad_sequence
@@ -26,7 +26,7 @@ def cast_tuple(val, length=1):
 
 
 # dataset functions
-def align_phoneme(labels, downsample_factor, sr=24000):
+def align_phoneme(labels, downsample_factor, sr=24000, speed_factor=1.0):
     sampling_rate = sr / downsample_factor
     silence_tokens = ["sp", "sil", "spn", ""]
     # Generate the sequence of labels based on duration and sampling rate
@@ -36,13 +36,13 @@ def align_phoneme(labels, downsample_factor, sr=24000):
         if label in silence_tokens:
             label = "<SIL>"
         duration_in_seconds = end_time - start_time
-        repeat_count = int(duration_in_seconds * sampling_rate)
-        residual += duration_in_seconds * sampling_rate - repeat_count
+        repeat_count = int(duration_in_seconds * sampling_rate * speed_factor)
+        residual += duration_in_seconds * sampling_rate * speed_factor - repeat_count
         if residual > 1:
             repeat_count += 1
             residual -= 1
         label_sequence.extend([label] * repeat_count)
-    end_total_time = math.ceil(end_time * sampling_rate)
+    end_total_time = math.ceil(end_time * sampling_rate * speed_factor)
     if len(label_sequence) < end_total_time - 2:
         label_sequence.extend(["<SIL>"] * ((end_total_time - 2) - len(label_sequence)))
     if len(label_sequence) >= end_total_time - 2:
@@ -73,6 +73,7 @@ class AudioDataset(Dataset):
         reuturn_text=False,
         downsample_factor=None,
         split_to_use=["train-clean-100", "train-clean-360", "train-other-500"],
+        speed_factor=1.0,
     ):
         super().__init__()
         path = Path(folder)
@@ -83,6 +84,7 @@ class AudioDataset(Dataset):
 
         with open(json_pathlist, "r") as f:
             valid_files_per_split = json.load(f)
+
         # read file names for each split
         self.data = [
             {
@@ -106,17 +108,24 @@ class AudioDataset(Dataset):
             for name in file_names
         ]
 
+        random.seed(42)
+
+        random.shuffle(self.data)
+
         self.tokenizer = tokenizer
         self.return_text = reuturn_text
         self.downsample_factor = downsample_factor
         self.audio_extension = audio_extension
+        self.speed_factor = speed_factor
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         data = self.data[idx]
-        phonemes = align_phoneme(parse_textgrid(data["textgrid"]), self.downsample_factor)
+        phonemes = align_phoneme(
+            parse_textgrid(data["textgrid"]), self.downsample_factor, speed_factor=self.speed_factor
+        )
         phoneme_ids = self.tokenizer.encode_phonemes(phonemes)
 
         if self.audio_extension == ".pt":
