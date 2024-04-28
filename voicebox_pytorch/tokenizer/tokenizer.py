@@ -27,6 +27,7 @@ class Tokenizer:
         self.sequence_begin_token_id = self.phoneme_to_id[self.sequence_begin_token]
         self.sequence_end_token_id = self.phoneme_to_id[self.sequence_end_token]
         self.unknown_token_id = self.phoneme_to_id[self.unknown_token]
+        self.pad_token_id = self.phoneme_to_id[self.pad_token]
 
     def arpa_to_ipa(self, arpa_phonemes: List[str]):
         ipa_phonemes = []

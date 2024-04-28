@@ -5,6 +5,14 @@ from glob import glob
 import argparse
 import librosa
 from tqdm import tqdm
+import torch
+from einops import rearrange
+import torchaudio
+from voicebox_pytorch import (
+    VoiceBox,
+    EncodecVoco,
+    ConditionalFlowMatcherWrapper,
+)
 
 """This script takes the folder of the original dataset and integrates phoneme labels information, providing an hdf5 file"""
 
@@ -22,7 +30,8 @@ if __name__ == "__main__":
             try:
                 audio_file = os.path.join(root, split, speaker, folder, f"{file}.wav")
                 duration = librosa.get_duration(filename=audio_file)
-            except:
+            except Exception as e:
+                print(f"Error: {e}")
                 continue
 
             if duration <= 10:

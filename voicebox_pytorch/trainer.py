@@ -1,9 +1,10 @@
 import re
+import random
 from pathlib import Path
 from shutil import rmtree
 from functools import partial
 from contextlib import nullcontext
-
+import torch.nn.functional as F
 from beartype import beartype
 from einops import rearrange
 import glob
@@ -86,7 +87,7 @@ class VoiceBoxTrainer(nn.Module):
         grad_accum_every=1,
         wd=0.0,
         max_grad_norm=0.5,
-        valid_frac=0.05,
+        valid_frac=0.02,
         random_split_seed=42,
         log_every=10,
         save_results_every=1000,
@@ -284,6 +285,7 @@ class VoiceBoxTrainer(nn.Module):
                     batch["wave"].half(),
                     phoneme_ids=batch["phoneme_ids"],
                     mask=batch["pad_mask"],
+                    # cond=batch["wave"].half() if random.random() < 0.2 else None,
                 )
 
                 self.accelerator.backward(loss / self.grad_accum_every)
@@ -303,11 +305,12 @@ class VoiceBoxTrainer(nn.Module):
         # log
 
         if not steps % self.log_every:
-            self.print(f"{steps}: loss: {logs['loss']:0.3f}")
+            self.print(f"{steps}: loss: {logs['loss']:0.3f} lr: {self.optim.param_groups[0]['lr']:0.3e}")
         if self.is_main:
             self.writer.add_scalar("Train/train_loss", logs["loss"], steps)
             percentage_processed = steps / self.total_len
             self.writer.add_scalar("Train/Percentage_processed", percentage_processed, steps)
+            self.writer.add_scalar("Train/l_r", self.optim.param_groups[0]["lr"], steps)
 
         self.accelerator.log({"train_loss": logs["loss"]}, step=steps)
 
@@ -319,27 +322,91 @@ class VoiceBoxTrainer(nn.Module):
             (batch,) = next(self.valid_dl_iter)
             unwrapped_model = self.accelerator.unwrap_model(self.cfm_wrapper)
 
+            # select 5 example for unconditional and 5 for conditional
+            batch_unconditional = {k: v[:5] for k, v in batch.items()}
+            batch_conditional = {k: v[5:10] for k, v in batch.items()}
+
             with torch.inference_mode():
                 unwrapped_model.eval()
 
-                wave = batch["wave"].to(unwrapped_model.device)
-                phoneme_ids = batch["phoneme_ids"].to(unwrapped_model.device)
-                mask = batch["pad_mask"].to(unwrapped_model.device)
-                valid_loss = unwrapped_model(wave, phoneme_ids=phoneme_ids, mask=mask)
-
                 # unconditional generation
-                output_wave = unwrapped_model.sample(phoneme_ids=phoneme_ids[0].unsqueeze(0), steps=32, cond_scale=1.0)
-                output_wave = rearrange(output_wave, "1 1 n -> 1 n")
+                wave_cond = batch_unconditional["wave"].to(unwrapped_model.device)
+                phoneme_ids_cond = batch_unconditional["phoneme_ids"].to(unwrapped_model.device)
+                mask_cond = batch_unconditional["pad_mask"].to(unwrapped_model.device)
+                # valid_loss = unwrapped_model(wave, phoneme_ids=phoneme_ids, mask=mask)
+                # self.print(f"{steps}: valid loss {valid_loss:0.3f}")
+                # self.accelerator.log({"valid_loss": valid_loss}, step=steps)
+                output_waves = unwrapped_model.sample(
+                    phoneme_ids=phoneme_ids_cond,
+                    steps=32,
+                    cond_scale=1.2,
+                )
+                # output_wave = rearrange(output_wave, "1 1 n -> 1 n")
 
                 # save audio
-                self.writer.add_audio(
-                    "Generated_sample", output_wave.detach().cpu().view(-1).unsqueeze(-1), steps, sample_rate=24_000
+                for i, wave in enumerate(output_waves):
+                    first_false_index = torch.argmax((~mask_cond[i]).to(torch.float32)) * 320
+                    # truncate the wave following the pad maskf
+                    wave = wave[:, : int(first_false_index)]
+                    try:
+                        self.writer.add_audio(
+                            f"Unconditional/sample_{i}",
+                            wave.detach().cpu().view(-1).unsqueeze(-1),
+                            steps,
+                            sample_rate=24_000,
+                        )
+                    except Exception as e:
+                        self.print(e)
+                        pass
+
+                # batch conditional generation
+                # get 3s of the conditioning wave
+                wave_cond = wave_cond[:, : int(3 * 75)]
+                phoneme_ids_cond = phoneme_ids_cond[:, : int(3 * 75)]
+
+                wave = batch_conditional["wave"].to(unwrapped_model.device)
+                phoneme_ids = batch_conditional["phoneme_ids"].to(unwrapped_model.device)
+                mask = batch_conditional["pad_mask"].to(unwrapped_model.device)
+                wave_seq_len = wave.size(1)  # already encoded
+
+                condition = torch.cat([wave_cond, wave], dim=1).to(torch.float32)  # assuming encodec audio
+                condition_mask = torch.cat(
+                    [
+                        torch.zeros_like(phoneme_ids_cond, dtype=torch.bool),
+                        torch.ones_like(phoneme_ids, dtype=torch.bool),
+                    ],
+                    dim=-1,
+                ).to(unwrapped_model.device)
+                phoneme_ids = torch.cat([phoneme_ids_cond, phoneme_ids], dim=-1)
+
+                output_waves = unwrapped_model.sample(
+                    phoneme_ids=phoneme_ids,
+                    cond=condition,
+                    cond_mask=condition_mask,
+                    steps=32,
+                    cond_scale=1.2,
                 )
 
-                self.print(f"{steps}: valid loss {valid_loss:0.3f}")
-                self.accelerator.log({"valid_loss": valid_loss}, step=steps)
+                # save audio
+                for i, wave in enumerate(output_waves):
+                    first_false_index = torch.argmax((~mask[i]).to(torch.float32)) * 320 + (
+                        wave_cond.size(1) * 320
+                    )  # assuming encodec audio
+                    # truncate the wave following the pad mask
+                    wave = wave[:, : int(first_false_index)]
+                    try:
+                        self.writer.add_audio(
+                            f"Conditional/sample_{i}",
+                            wave.detach().cpu().view(-1).unsqueeze(-1),
+                            steps,
+                            sample_rate=24_000,
+                        )
+                    except Exception as e:
+                        self.print(e)
+                        pass
 
-                del batch
+                del batch_conditional
+                del batch_unconditional
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -361,3 +428,12 @@ class VoiceBoxTrainer(nn.Module):
 
         self.print("training complete")
         self.accelerator.end_training()
+
+
+def random_seq_mask(batch_size, seq_len, min_percentage=0.48, max_percentage=0.52):
+    # Generate a random binary mask with ones and zeros
+    mask = torch.zeros(batch_size, seq_len)
+    num_ones = int(torch.randint(int(min_percentage * seq_len), int(max_percentage * seq_len), (1,)))
+    mask[:, num_ones:] = 1
+
+    return mask.to(torch.bool)

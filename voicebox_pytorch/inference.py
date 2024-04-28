@@ -1,41 +1,77 @@
 import torch
+import random
 import argparse
 import datetime
 import torchaudio
+import random
+import glob
+from tqdm import tqdm
+from data import get_dataloader
 from config import config
 from einops import rearrange
 from data import AudioDataset
-from tokenizer import Tokenizer
+from tokenizer.tokenizer import Tokenizer
+from tensorboardX import SummaryWriter
 from voicebox_pytorch import VoiceBox, EncodecVoco, ConditionalFlowMatcherWrapper
-import random
 
 # parse arguments
 parser = argparse.ArgumentParser()
-# parser.add_argument("--checkpoint_path", type=str, default="hubert/hubert_base_ls960.pt")
-parser.add_argument("--kmeans_path", type=str, default="hubert/hubert_base_ls960_L9_km2000_expresso.bin")
-parser.add_argument("--model_path", type=str)
+parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.65000.pt")
 parser.add_argument(
-    "--audio_path", type=str, default="/net/tscratch/people/plgpiermelucci/data/LibriTTS/train-clean-360"
+    "--audio_path",
+    type=str,
+    default="/home/ubuntu/data/LibriTTSR/LibriTTS_R",
 )
-parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.76000.pt")
+
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
 
 if __name__ == "__main__":
     """Train example without text_to_semantic SpearTTS model."""
+
+    log_dir = "./inference_runs"
+    existing_runs = glob.glob(f"{log_dir}/*")
+    run_index = len(existing_runs) + 1
+    writer = SummaryWriter(log_dir=f"{log_dir}/{run_index}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     # phonem tokenizer
     tokenizer = Tokenizer(config)
+
+    # audio encoder
+    audio_enc_dec = EncodecVoco()
+    downsample_factor = audio_enc_dec.downsample_factor
     # dataset
     dataset = AudioDataset(
-        folder=args.audio_path, json_pathlist="valid_audio_files.json", tokenizer=tokenizer, reuturn_text=True
+        folder=args.audio_path,
+        json_pathlist="valid_short_files.json",
+        tokenizer=tokenizer,
+        downsample_factor=downsample_factor,
+        audio_extension=".pt",
+        split_to_use=["dev-clean"],
     )
-    data = random.choice(dataset)
-    audio, phoneme_ids, text = data["wave"].to(device), data["phoneme_ids"].to(device), data["text"]
-    print(text)
-    torchaudio.save("original.wav", audio.unsqueeze(0).cpu(), 24000)
+    dl_iter = cycle(get_dataloader(dataset, batch_size=16, shuffle=False, drop_last=False))
 
     # prepare cfm wrapper
-    model = VoiceBox(dim=512, audio_enc_dec=EncodecVoco(), num_cond_tokens=500, depth=2, dim_head=64, heads=16)
+    model = VoiceBox(
+        dim=512,
+        dim_cond_emb=512,
+        audio_enc_dec=audio_enc_dec,
+        num_cond_tokens=tokenizer.vocab_size + 20,  # number of phonemes + special tokens
+        depth=12,
+        dim_head=64,
+        heads=16,
+        ff_mult=4,
+        attn_qk_norm=False,
+        num_register_tokens=0,
+        use_gateloop_layers=False,
+    )
+
     cfm_wrapper = ConditionalFlowMatcherWrapper(voicebox=model, cond_drop_prob=0.2)
 
     # load checkpoint
@@ -43,60 +79,89 @@ if __name__ == "__main__":
     cfm_wrapper.load_state_dict(checkpoint["model"])
     cfm_wrapper = cfm_wrapper.to(device)
 
+    cond_scale = 1.3
     num_steps = 32
-    cond_scale = 1.05
+    steps = args.checkpoint_path.split(".")[-2]
 
-    # unconditional generation
-    start_date = datetime.datetime.now()
-    output_wave = cfm_wrapper.sample(phoneme_ids=phoneme_ids.unsqueeze(0), steps=num_steps, cond_scale=cond_scale)
-    elapsed_time = (datetime.datetime.now() - start_date).total_seconds()
+    with torch.inference_mode():
+        (batch,) = next(dl_iter)
 
-    output_wave = rearrange(output_wave, "1 1 n -> 1 n")
-    output_duration = float(output_wave.shape[1]) / 24000
-    realtime_mult = output_duration / elapsed_time
+        # select 8 example for unconditional and 8 for conditional
+        batch_unconditional = {k: v[:8] for k, v in batch.items()}
+        batch_conditional = {k: v[8:16] for k, v in batch.items()}
 
-    print(
-        f"\nGenerated sample of duration {output_duration:0.2f}s in {elapsed_time}s ({realtime_mult:0.2f}x realtime)\n\n"
-    )
+        for cond_scale in tqdm([1.0, 1.1, 1.2, 1.3]):
+            print(f"Generating {cond_scale} cond_scale")
+            # unconditional generation
+            wave_cond = batch_unconditional["wave"].to(device)
+            phoneme_ids_cond = batch_unconditional["phoneme_ids"].to(device)
+            mask_cond = batch_unconditional["pad_mask"].to(device)
 
-    # save audio
-    torchaudio.save("unconditional.wav", output_wave.cpu(), 24000)
+            output_waves = cfm_wrapper.sample(
+                phoneme_ids=phoneme_ids_cond,
+                steps=num_steps,
+                cond_scale=cond_scale,
+            )
+            # output_wave = rearrange(output_wave, "1 1 n -> 1 n")
 
-    # conditional generation
-    infill_data = random.choice(dataset)
-    audio_infill, phoneme_ids_infill, text_infill = (
-        infill_data["wave"].to(device),
-        infill_data["phoneme_ids"].to(device),
-        infill_data["text"],
-    )
-    print(text_infill)
-    torchaudio.save("infill.wav", audio_infill.unsqueeze(0).cpu(), 24000)
-    start_date = datetime.datetime.now()
-    cond = torch.cat([audio_infill.unsqueeze(0), audio.unsqueeze(0)], dim=-1).to(device)
-    cond_mask = torch.cat(
-        [
-            torch.zeros_like(phoneme_ids_infill.unsqueeze(0)).to(torch.bool),
-            torch.ones_like(phoneme_ids.unsqueeze(0)).to(torch.bool),
-        ],
-        dim=-1,
-    ).to(device)
-    output_wave = cfm_wrapper.sample(
-        cond=cond,
-        cond_mask=cond_mask,
-        phoneme_ids=torch.cat([phoneme_ids_infill.unsqueeze(0), phoneme_ids.unsqueeze(0)], dim=-1),
-        steps=num_steps,
-        cond_scale=cond_scale,
-    )
-    elapsed_time = (datetime.datetime.now() - start_date).total_seconds()
+            # save audio
+            for i, wave in enumerate(output_waves):
+                first_false_index = torch.argmax((~mask_cond[i]).to(torch.float32)) * 320
+                # truncate the wave following the pad maskf
+                wave = wave[:, : int(first_false_index)]
+                try:
+                    writer.add_audio(
+                        f"Unconditional_{cond_scale}/sample_{i}",
+                        wave.detach().cpu().view(-1).unsqueeze(-1),
+                        steps,
+                        sample_rate=24_000,
+                    )
+                except Exception as e:
+                    print(e)
+                    pass
 
-    output_wave = rearrange(output_wave, "1 1 n -> 1 n")
-    output_wave = output_wave[:, audio_infill.size(-1) :]
-    output_duration = float(output_wave.shape[1]) / 24000
-    realtime_mult = output_duration / elapsed_time
+            # batch conditional generation
+            # get 3s of the conditioning wave
+            wave_cond = wave_cond[:, : int(3 * 75)]
+            phoneme_ids_cond = phoneme_ids_cond[:, : int(3 * 75)]
 
-    print(
-        f"\nGenerated sample of duration {output_duration:0.2f}s in {elapsed_time}s ({realtime_mult:0.2f}x realtime)\n\n"
-    )
+            wave = batch_conditional["wave"].to(device)
+            phoneme_ids = batch_conditional["phoneme_ids"].to(device)
+            mask = batch_conditional["pad_mask"].to(device)
+            wave_seq_len = wave.size(1)  # already encoded
 
-    # save audio
-    torchaudio.save("conditional.wav", output_wave.cpu(), 24000)
+            condition = torch.cat([wave_cond, wave], dim=1).to(torch.float32)  # assuming encodec audio
+            condition_mask = torch.cat(
+                [
+                    torch.zeros_like(phoneme_ids_cond, dtype=torch.bool),
+                    torch.ones_like(phoneme_ids, dtype=torch.bool),
+                ],
+                dim=-1,
+            ).to(device)
+            phoneme_ids = torch.cat([phoneme_ids_cond, phoneme_ids], dim=-1)
+
+            output_waves = cfm_wrapper.sample(
+                phoneme_ids=phoneme_ids,
+                cond=condition,
+                cond_mask=condition_mask,
+                steps=num_steps,
+                cond_scale=cond_scale,
+            )
+
+            # save audio
+            for i, wave in enumerate(output_waves):
+                first_false_index = torch.argmax((~mask[i]).to(torch.float32)) * 320 + (
+                    wave_cond.size(1) * 320
+                )  # assuming encodec audio
+                # truncate the wave following the pad mask
+                wave = wave[:, : int(first_false_index)]
+                try:
+                    writer.add_audio(
+                        f"Conditional_{cond_scale}/sample_{i}",
+                        wave.detach().cpu().view(-1).unsqueeze(-1),
+                        steps,
+                        sample_rate=24_000,
+                    )
+                except Exception as e:
+                    print(e)
+                    pass
