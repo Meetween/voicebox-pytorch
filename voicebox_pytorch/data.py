@@ -137,6 +137,8 @@ class AudioDataset(Dataset):
                 text = f.read()
             data["text"] = text
 
+        data["idx"] = idx
+
         return data
 
 
@@ -180,7 +182,7 @@ def pad_to_longest_fn(data):
     audio = pad_sequence(audio, batch_first=True)
     phoneme_ids = pad_sequence(phoneme_ids, batch_first=True)
     pad_mask = ~(phoneme_ids == 0)
-    return {"wave": audio, "phoneme_ids": phoneme_ids, "pad_mask": pad_mask}
+    return {"wave": audio, "phoneme_ids": phoneme_ids, "pad_mask": pad_mask, "idx": [datum["idx"] for datum in data]}
 
 
 def get_dataloader(ds, pad_to_longest=True, **kwargs):
