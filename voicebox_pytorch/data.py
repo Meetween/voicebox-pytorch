@@ -107,7 +107,7 @@ class AudioDataset(Dataset):
             if split in split_to_use
             for name in file_names
         ]
-
+        # FIXME needed for the speed evaluation
         random.seed(42)
 
         random.shuffle(self.data)
