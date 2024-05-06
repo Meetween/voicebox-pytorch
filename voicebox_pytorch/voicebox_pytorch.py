@@ -1137,7 +1137,7 @@ class ConditionalFlowMatcherWrapper(Module):
         voicebox: VoiceBox,
         text_to_semantic: Optional[TextToSemantic] = None,
         duration_predictor: Optional[DurationPredictor] = None,
-        sigma=0.0,
+        sigma=1e-5,
         ode_atol=1e-5,
         ode_rtol=1e-5,
         use_torchode=False,
