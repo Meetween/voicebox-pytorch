@@ -15,7 +15,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 
 # parse arguments
 parser = argparse.ArgumentParser()
-parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.65000.pt")
+parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.11000.pt")
 parser.add_argument("--resume_training", action="store_true")
 parser.add_argument(
     "--audio_path",
@@ -48,18 +48,18 @@ if __name__ == "__main__":
     # dataset
     dataset = AudioDataset(
         folder=args.audio_path,
-        json_pathlist="valid_short_files.json",
+        json_pathlist="train_ids.json",
         tokenizer=tokenizer,
         downsample_factor=downsample_factor,
-        audio_extension=".pt",
+        audio_extension=".wav",
     )
 
     # prepare cfm wrapper
     model = VoiceBox(
         dim=512,
         dim_cond_emb=512,
-        audio_enc_dec=EncodecVoco(),
-        num_cond_tokens=tokenizer.vocab_size + 20,  # number of phonemes + special tokens
+        audio_enc_dec=EncodecVoco(bandwidth_id=2),
+        num_cond_tokens=tokenizer.vocab_size + 20,  # number of phonemes + special tokens + extra tokens
         depth=12,
         dim_head=64,
         heads=16,
@@ -69,17 +69,23 @@ if __name__ == "__main__":
         use_gateloop_layers=False,
     )
 
-    cfm_wrapper = ConditionalFlowMatcherWrapper(voicebox=model, cond_drop_prob=0.2)
+    cfm_wrapper = ConditionalFlowMatcherWrapper(
+        voicebox=model,
+        cond_drop_prob=0.2,
+        sigma=1e-5,
+    )
 
     # Let's train!
     trainer = VoiceBoxTrainer(
         cfm_wrapper=cfm_wrapper,
         dataset=dataset,
         lr=1e-4,
-        batch_size=256,
+        batch_size=128,
         num_train_steps=150_000,
         num_warmup_steps=5000,
         accelerator=accelerator,
+        save_results_every=1000,
+        save_model_every=1000,
     )
     if args.resume_training:
         trainer.load(args.checkpoint_path)

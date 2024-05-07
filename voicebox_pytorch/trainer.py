@@ -86,8 +86,8 @@ class VoiceBoxTrainer(nn.Module):
         initial_lr=1e-5,
         grad_accum_every=1,
         wd=0.0,
-        max_grad_norm=0.5,
-        valid_frac=0.02,
+        max_grad_norm=0.2,
+        valid_frac=0.005,
         random_split_seed=42,
         log_every=10,
         save_results_every=1000,
@@ -101,6 +101,12 @@ class VoiceBoxTrainer(nn.Module):
 
         # accelerator
         self.accelerator = accelerator
+        if accelerator.mixed_precision == "fp16":
+            self.weight_dtype = torch.float16
+        elif accelerator.mixed_precision == "bf16":
+            self.weight_dtype = torch.bfloat16
+        else:
+            self.weight_dtype = torch.float32
 
         self.cfm_wrapper = cfm_wrapper
 
@@ -163,6 +169,7 @@ class VoiceBoxTrainer(nn.Module):
         (self.cfm_wrapper, self.optim, self.scheduler, self.dl) = self.accelerator.prepare(
             self.cfm_wrapper, self.optim, self.scheduler, self.dl
         )
+        # self.cfm_wrapper = self.cfm_wrapper.to(self.weight_dtype)
 
         # dataloader iterators
 
@@ -203,6 +210,11 @@ class VoiceBoxTrainer(nn.Module):
             self.writer = SummaryWriter(log_dir=f"{log_dir}/{run_index}")
 
         self.total_len = len(self.ds) // batch_size
+
+        # for param in self.cfm_wrapper.parameters():
+        #     # only upcast trainable parameters into fp32
+        #     if param.requires_grad:
+        #         param.data = param.to(torch.float32)
 
     def save(self, path):
         pkg = dict(
@@ -282,10 +294,10 @@ class VoiceBoxTrainer(nn.Module):
 
             with self.accelerator.autocast(), context():
                 loss = self.cfm_wrapper(
-                    batch["wave"].half(),
+                    batch["wave"].to(self.weight_dtype),
                     phoneme_ids=batch["phoneme_ids"],
                     mask=batch["pad_mask"],
-                    # cond=batch["wave"].half() if random.random() < 0.2 else None,
+                    cond=batch["wave"].to(self.weight_dtype) if random.random() < 0.5 else None,
                 )
 
                 self.accelerator.backward(loss / self.grad_accum_every)
