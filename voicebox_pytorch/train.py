@@ -15,7 +15,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 
 # parse arguments
 parser = argparse.ArgumentParser()
-parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.11000.pt")
+parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.156000.pt")
 parser.add_argument("--resume_training", action="store_true")
 parser.add_argument(
     "--audio_path",
@@ -80,8 +80,8 @@ if __name__ == "__main__":
         cfm_wrapper=cfm_wrapper,
         dataset=dataset,
         lr=1e-4,
-        batch_size=128,
-        num_train_steps=150_000,
+        batch_size=256,
+        num_train_steps=250_000,
         num_warmup_steps=5000,
         accelerator=accelerator,
         save_results_every=1000,

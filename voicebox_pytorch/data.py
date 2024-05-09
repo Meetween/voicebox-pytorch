@@ -43,11 +43,11 @@ def align_phoneme(labels, downsample_factor, sr=24000, speed_factor=1.0):
             residual -= 1
         label_sequence.extend([label] * repeat_count)
     end_total_time = math.ceil(end_time * sampling_rate * speed_factor)
-    if len(label_sequence) < end_total_time - 2:
-        label_sequence.extend(["<SIL>"] * ((end_total_time - 2) - len(label_sequence)))
-    if len(label_sequence) >= end_total_time - 2:
-        label_sequence = label_sequence[: end_total_time - 2]
-    assert len(label_sequence) == end_total_time - 2, f"{len(label_sequence)} != {end_total_time - 2}"
+    if len(label_sequence) < end_total_time -1:
+        label_sequence.extend(["<SIL>"] * ((end_total_time -1) - len(label_sequence)))
+    if len(label_sequence) >= end_total_time -1:
+        label_sequence = label_sequence[: end_total_time -1]
+    assert len(label_sequence) == end_total_time -1, f"{len(label_sequence)} != {end_total_time -1}"
     if label_sequence[-1] != "<SIL>":
         label_sequence[-1] = "<SIL>"
     return label_sequence
@@ -108,9 +108,9 @@ class AudioDataset(Dataset):
             for name in file_names
         ]
         # FIXME needed for the speed evaluation
-        random.seed(42)
+        # random.seed(420)
 
-        random.shuffle(self.data)
+        # random.shuffle(self.data)
 
         self.tokenizer = tokenizer
         self.return_text = reuturn_text
@@ -132,12 +132,18 @@ class AudioDataset(Dataset):
             wave = torch.load(data["audio"])
         elif self.audio_extension == ".wav":
             wave, sr = torchaudio.load(data["audio"])
-            assert sr == self.audio_encoder.sampling_rate, "sample rate must be 24_000"
+            #assert sr == self.audio_encoder.sampling_rate, "sample rate must be 24_000"
             wave = rearrange(wave, "1 ... -> ...")
+            #amplitude scaling
+            wave = wave * random.uniform(0.5, 1)
+            # phase invert
+            if random.random() > 0.5:
+                wave = wave * -1
 
-        seq_idx = -1 if self.audio_extension == ".wav" else 0
-        if wave.size(seq_idx) > len(phoneme_ids):
-            wave = wave[:, : len(phoneme_ids)] if self.audio_extension == ".wav" else wave[: len(phoneme_ids), :]
+        if self.audio_extension == ".pt":
+            seq_idx = 0
+            if wave.size(seq_idx) > len(phoneme_ids):
+                wave = wave[: len(phoneme_ids), :]
 
         data = {"wave": wave, "phoneme_ids": torch.tensor(phoneme_ids)}
         if self.return_text:

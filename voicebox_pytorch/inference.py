@@ -16,7 +16,7 @@ from voicebox_pytorch import VoiceBox, EncodecVoco, ConditionalFlowMatcherWrappe
 
 # parse arguments
 parser = argparse.ArgumentParser()
-parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.74000.pt")
+parser.add_argument("--checkpoint_path", type=str, default="results/voicebox.156000.pt")
 parser.add_argument(
     "--audio_path",
     type=str,
@@ -51,29 +51,29 @@ if __name__ == "__main__":
     # dataset
     dataset = AudioDataset(
         folder=args.audio_path,
-        json_pathlist="test_files.json",
+        json_pathlist="test_ids.json",
         tokenizer=tokenizer,
         downsample_factor=downsample_factor,
-        audio_extension=".pt",
+        audio_extension=".wav",
         split_to_use=["test-other", "test-clean"],
     )
 
     speed_dataset = AudioDataset(
         folder=args.audio_path,
-        json_pathlist="test_files.json",
+        json_pathlist="test_ids.json",
         tokenizer=tokenizer,
         downsample_factor=downsample_factor,
-        audio_extension=".pt",
+        audio_extension=".wav",
         split_to_use=["test-other", "test-clean"],
         speed_factor=0.8,
     )
 
     slow_dataset = AudioDataset(
         folder=args.audio_path,
-        json_pathlist="test_files.json",
+        json_pathlist="test_ids.json",
         tokenizer=tokenizer,
         downsample_factor=downsample_factor,
-        audio_extension=".pt",
+        audio_extension=".wav",
         split_to_use=["test-other", "test-clean"],
         speed_factor=1.25,
     )
@@ -110,7 +110,7 @@ if __name__ == "__main__":
     steps = args.checkpoint_path.split(".")[-2]
 
     with torch.inference_mode():
-        for name, iterable in zip(["1x", "1.25x", "0.8x"], [dl_iter, dl_iter_speed, dl_iter_slow]):
+        for name, iterable in zip(["1x"], [dl_iter]): #["1x", "1.25x", "0.8x"], [dl_iter, dl_iter_speed, dl_iter_slow]
             (batch,) = next(iterable)
 
             # select 8 example for unconditional and 8 for conditional
@@ -126,19 +126,21 @@ if __name__ == "__main__":
             # for cond_scale in tqdm([1.0, 1.3, 1.6]):
             print(f"Generating {cond_scale} cond_scale")
             # unconditional generation
-            wave_cond = batch_unconditional["wave"].to(device)
-            phoneme_ids_cond = batch_unconditional["phoneme_ids"].to(device)
-            mask_cond = batch_unconditional["pad_mask"].to(device)
+            original_voice = batch_unconditional["wave"].to(device)
+            # encode to codes
+            original_voice_encoded = audio_enc_dec.encode(original_voice.to(device)).squeeze(0)
+            original_phonemes = batch_unconditional["phoneme_ids"].to(device)
+            mask_original = batch_unconditional["pad_mask"].to(device)
 
             output_waves = cfm_wrapper.sample(
-                phoneme_ids=phoneme_ids_cond,
+                phoneme_ids=original_phonemes,
                 steps=num_steps,
                 cond_scale=cond_scale,
             )
 
             # save audio
             for i, wave in enumerate(output_waves):
-                first_false_index = torch.argmax((~mask_cond[i]).to(torch.float32)) * 320
+                first_false_index = torch.argmax((~mask_original[i]).to(torch.float32)) * 320
                 # truncate the wave following the pad maskf
                 wave = wave[:, : int(first_false_index)]
                 try:
@@ -155,29 +157,40 @@ if __name__ == "__main__":
                 # upload text
                 if name == "1x":
                     file_wav = dataset.data[idx_unconditional[i]]["audio"]
-                    with open(file_wav.replace(".pt", ".original.txt"), "r") as f:
+                    with open(file_wav.replace(".wav", ".original.txt"), "r") as f:
                         text = f.read()
                     writer.add_text(f"Unconditional/sample_{i}", text, steps)
+                # upload audio
+                    writer.add_audio(
+                        f"Voice_infilled/sample_{i}",
+                        original_voice[i].detach().cpu().view(-1).unsqueeze(-1),
+                        steps,
+                        sample_rate=24_000,
+                    )
+                
+
 
             # batch conditional generation
             # get 3s of the conditioning wave
-            wave_cond = wave_cond[:, : int(5 * 75)]
-            phoneme_ids_cond = phoneme_ids_cond[:, : int(5 * 75)]
-
-            wave = batch_conditional["wave"].to(device)
-            phoneme_ids = batch_conditional["phoneme_ids"].to(device)
+            # 0
+            #original_voice = original_voice
+            #original_phonemes = original_phonemes
+             # 1
+            conditioning_voice = batch_conditional["wave"].to(device)
+            conditioning_voice_encoded = audio_enc_dec.encode(conditioning_voice.to(device)).squeeze(0)[:, : int(3 * 75)]
+            phoneme_ids = batch_conditional["phoneme_ids"].to(device)[:, : int(3 * 75)]
             mask = batch_conditional["pad_mask"].to(device)
-            wave_seq_len = wave.size(1)  # already encoded
+            wave_seq_len = conditioning_voice.size(1)  # already encoded
 
-            condition = torch.cat([wave_cond, wave], dim=1).to(torch.float32)  # assuming encodec audio
+            condition = torch.cat([conditioning_voice_encoded, torch.randn_like(original_voice_encoded)], dim=1).to(torch.float32)  # assuming encodec audio
             condition_mask = torch.cat(
                 [
-                    torch.zeros_like(phoneme_ids_cond, dtype=torch.bool),
-                    torch.ones_like(phoneme_ids, dtype=torch.bool),
+                    torch.zeros_like(phoneme_ids, dtype=torch.bool), 
+                    torch.ones_like(original_phonemes, dtype=torch.bool),
                 ],
                 dim=-1,
             ).to(device)
-            phoneme_ids = torch.cat([phoneme_ids_cond, phoneme_ids], dim=-1)
+            phoneme_ids = torch.cat([phoneme_ids, original_phonemes], dim=-1)
 
             output_waves = cfm_wrapper.sample(
                 phoneme_ids=phoneme_ids,
@@ -189,15 +202,15 @@ if __name__ == "__main__":
 
             # save audio
             for i, wave in enumerate(output_waves):
-                first_false_index = torch.argmax((~mask[i]).to(torch.float32)) * 320 + (
-                    wave_cond.size(1) * 320
+                first_false_index = torch.argmax((~mask_original[i]).to(torch.float32)) * 320 + (
+                    conditioning_voice_encoded.size(1) * 320
                 )  # assuming encodec audio
-                original_wave = wave[:, : int(wave_cond.size(1) * 320)]
+                zero_masked_wave = wave[:, : int(conditioning_voice_encoded.size(1) * 320)]
                 # truncate the wave following the pad mask
-                wave = wave[:, int(wave_cond.size(1) * 320) : int(first_false_index)]
+                wave = wave[:, int(conditioning_voice_encoded.size(1) * 320) : int(first_false_index)]
                 try:
                     writer.add_audio(
-                        f"Conditional_{name}/sample_{i}",
+                        f"One_mask_infilled_{name}/sample_{i}",
                         wave.detach().cpu().view(-1).unsqueeze(-1),
                         steps,
                         sample_rate=24_000,
@@ -209,8 +222,14 @@ if __name__ == "__main__":
                 if name == "1x":
                     try:
                         writer.add_audio(
-                            f"Original_condition/sample_{i}",
-                            original_wave.detach().cpu().view(-1).unsqueeze(-1),
+                            f"Zero_mask_inilled/sample_{i}",
+                            zero_masked_wave.detach().cpu().view(-1).unsqueeze(-1),
+                            steps,
+                            sample_rate=24_000,
+                        )
+                        writer.add_audio(
+                            f"Conditioning_voice/sample_{i}",
+                            conditioning_voice[i].detach().cpu().view(-1).unsqueeze(-1),
                             steps,
                             sample_rate=24_000,
                         )
@@ -220,6 +239,6 @@ if __name__ == "__main__":
 
                     # upload text
                     file_wav = dataset.data[idx_conditional[i]]["audio"]
-                    with open(file_wav.replace(".pt", ".original.txt"), "r") as f:
+                    with open(file_wav.replace(".wav", ".original.txt"), "r") as f:
                         text = f.read()
-                    writer.add_text(f"Conditional/sample_{i}", text, steps)
+                    writer.add_text(f"Infilled/sample_{i}", text, steps)

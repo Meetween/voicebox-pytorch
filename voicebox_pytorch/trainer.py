@@ -297,7 +297,7 @@ class VoiceBoxTrainer(nn.Module):
                     batch["wave"].to(self.weight_dtype),
                     phoneme_ids=batch["phoneme_ids"],
                     mask=batch["pad_mask"],
-                    cond=batch["wave"].to(self.weight_dtype) if random.random() < 0.5 else None,
+                    cond=None#batch["wave"].to(self.weight_dtype) if random.random() < 0.5 else None,
                 )
 
                 self.accelerator.backward(loss / self.grad_accum_every)
@@ -342,22 +342,23 @@ class VoiceBoxTrainer(nn.Module):
                 unwrapped_model.eval()
 
                 # unconditional generation
-                wave_cond = batch_unconditional["wave"].to(unwrapped_model.device)
-                phoneme_ids_cond = batch_unconditional["phoneme_ids"].to(unwrapped_model.device)
-                mask_cond = batch_unconditional["pad_mask"].to(unwrapped_model.device)
+                wave = batch_unconditional["wave"].to(unwrapped_model.device)
+                wave_original_encoded = unwrapped_model.voicebox.audio_enc_dec.encode(wave).squeeze(0)
+                phoneme_ids = batch_unconditional["phoneme_ids"].to(unwrapped_model.device)
+                mask = batch_unconditional["pad_mask"].to(unwrapped_model.device)
                 # valid_loss = unwrapped_model(wave, phoneme_ids=phoneme_ids, mask=mask)
                 # self.print(f"{steps}: valid loss {valid_loss:0.3f}")
                 # self.accelerator.log({"valid_loss": valid_loss}, step=steps)
                 output_waves = unwrapped_model.sample(
-                    phoneme_ids=phoneme_ids_cond,
+                    phoneme_ids=phoneme_ids,
                     steps=32,
-                    cond_scale=1.2,
+                    cond_scale=1.3,
                 )
                 # output_wave = rearrange(output_wave, "1 1 n -> 1 n")
 
                 # save audio
                 for i, wave in enumerate(output_waves):
-                    first_false_index = torch.argmax((~mask_cond[i]).to(torch.float32)) * 320
+                    first_false_index = torch.argmax((~mask[i]).to(torch.float32)) * 320
                     # truncate the wave following the pad maskf
                     wave = wave[:, : int(first_false_index)]
                     try:
@@ -373,15 +374,13 @@ class VoiceBoxTrainer(nn.Module):
 
                 # batch conditional generation
                 # get 3s of the conditioning wave
-                wave_cond = wave_cond[:, : int(3 * 75)]
-                phoneme_ids_cond = phoneme_ids_cond[:, : int(3 * 75)]
-
-                wave = batch_conditional["wave"].to(unwrapped_model.device)
-                phoneme_ids = batch_conditional["phoneme_ids"].to(unwrapped_model.device)
-                mask = batch_conditional["pad_mask"].to(unwrapped_model.device)
+                wave_cond = batch_conditional["wave"].to(unwrapped_model.device)
+                wave_cond = unwrapped_model.voicebox.audio_enc_dec.encode(wave_cond).squeeze(0)[:, : int(3 * 75)]
+                phoneme_ids_cond = batch_conditional["phoneme_ids"].to(unwrapped_model.device)[:, : int(3 * 75)]
+                mask_cond = batch_conditional["pad_mask"].to(unwrapped_model.device)
                 wave_seq_len = wave.size(1)  # already encoded
 
-                condition = torch.cat([wave_cond, wave], dim=1).to(torch.float32)  # assuming encodec audio
+                condition = torch.cat([wave_cond, torch.randn_like(wave_original_encoded)], dim=1).to(torch.float32)  # assuming encodec audio
                 condition_mask = torch.cat(
                     [
                         torch.zeros_like(phoneme_ids_cond, dtype=torch.bool),
@@ -396,7 +395,7 @@ class VoiceBoxTrainer(nn.Module):
                     cond=condition,
                     cond_mask=condition_mask,
                     steps=32,
-                    cond_scale=1.2,
+                    cond_scale=1.3,
                 )
 
                 # save audio
@@ -405,7 +404,7 @@ class VoiceBoxTrainer(nn.Module):
                         wave_cond.size(1) * 320
                     )  # assuming encodec audio
                     # truncate the wave following the pad mask
-                    wave = wave[:, : int(first_false_index)]
+                    wave = wave[:, int(wave_cond.size(1) * 320) : int(first_false_index)]
                     try:
                         self.writer.add_audio(
                             f"Conditional/sample_{i}",
